@@ -1,6 +1,6 @@
 import { useState, useRef, useEffect } from "react";
 
-const API = "http://127.0.0.1:5000";
+const API = "https://careerpilot-api-v1i2.onrender.com";
 
 // ── helpers ──────────────────────────────────────────────────────────────────
 function extractScore(text) {
