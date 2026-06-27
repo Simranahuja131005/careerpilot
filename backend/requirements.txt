@@ -6,3 +6,5 @@ google-generativeai
 pdfplumber
 reportlab
 gunicorn
+scikit-learn
+spacy

@@ -12,6 +12,7 @@ from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, HRFlowable
 from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
 from reportlab.lib.units import inch
 from reportlab.lib import colors
+from scoring_engine import compute_match_score
 
 load_dotenv()
 
@@ -286,3 +287,121 @@ async def export_pdf(request: ExportRequest):
 
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"PDF export failed: {str(e)}")
+    
+
+def build_explanation_prompt(resume_text: str, job: str, score_breakdown) -> str:
+    """
+    Unlike build_analysis_prompt() in the original version, this prompt does
+    NOT ask Gemini to invent a score. It is given the score (and the exact
+    signals that produced it) and asked only to explain it in natural
+    language and suggest improvements. The number itself comes from our
+    own TF-IDF + skill-matching algorithm in scoring_engine.py.
+    """
+    return f"""
+You are a career coach. A custom scoring algorithm has already analyzed this
+resume against the job description and produced the following results.
+Do NOT invent or change the score — explain it and build on it.
+ 
+Computed ATS Match Score: {score_breakdown.final_score}/100
+ 
+Score breakdown (already computed, do not recalculate):
+- Text/semantic similarity (TF-IDF cosine): {score_breakdown.tfidf_similarity_score}/100
+- Skill keyword match: {score_breakdown.skill_match_score}/100
+- Experience signal: {score_breakdown.experience_score}/100
+- Resume section completeness: {score_breakdown.section_completeness_score}/100
+ 
+Matched skills (already detected): {', '.join(score_breakdown.matched_skills) or 'None'}
+Missing skills (already detected): {', '.join(score_breakdown.missing_skills) or 'None'}
+Resume sections found: {', '.join(score_breakdown.resume_sections_found) or 'None'}
+ 
+Resume:
+{resume_text}
+ 
+Job Description:
+{job}
+ 
+Respond in this exact markdown format:
+ 
+## Match Summary
+[2-3 sentences explaining IN PLAIN LANGUAGE why the score came out this way,
+referencing the breakdown above. Do not state a different score.]
+ 
+## Why These Skills Matched
+[1-2 sentences on the matched skills and how strongly they align with the role.]
+ 
+## Why These Skills Are Missing
+[1-2 sentences on the missing skills and how critical they likely are for this role.]
+ 
+## Suggestions
+1. [Actionable suggestion 1, tailored to the missing skills/weak sections above]
+2. [Actionable suggestion 2]
+3. [Actionable suggestion 3]
+ 
+## Recommended Resume Tweaks
+- [Specific tweak 1]
+- [Specific tweak 2]
+- [Specific tweak 3]
+""".strip()
+ 
+ 
+@app.post("/upload-resume-v2")
+async def upload_resume_v2(
+    resume: UploadFile = File(...),
+    job: str = Form(...)
+):
+    """
+    Custom-scoring version of the analyze endpoint.
+ 
+    Pipeline:
+      1. Extract resume text from PDF (pdfplumber) — same as before.
+      2. Run OUR OWN scoring algorithm (scoring_engine.compute_match_score):
+         TF-IDF cosine similarity + skill keyword matching + experience
+         heuristic + section completeness, combined via a weighted formula.
+      3. Pass that score + its breakdown to Gemini ONLY to generate a
+         natural-language explanation and suggestions — Gemini never
+         decides the number.
+ 
+    This keeps the score itself fully deterministic and explainable
+    independent of the LLM, which is the core academic contribution of
+    this version of the project.
+    """
+    if not job.strip():
+        raise HTTPException(status_code=400, detail="No job description provided.")
+ 
+    try:
+        file_bytes = await resume.read()
+        resume_text = extract_pdf_text(file_bytes)
+ 
+        if not resume_text:
+            raise HTTPException(
+                status_code=400,
+                detail="Could not extract text from PDF. Is it a scanned image?"
+            )
+ 
+        # ---- Step A: OUR OWN scoring algorithm (no LLM) ----
+        score_breakdown = compute_match_score(resume_text, job)
+ 
+        # ---- Step B: Gemini explains the already-computed score ----
+        explanation_prompt = build_explanation_prompt(resume_text, job, score_breakdown)
+        response = model.generate_content(explanation_prompt)
+ 
+        return {
+            "score": score_breakdown.final_score,
+            "score_breakdown": {
+                "tfidf_similarity": score_breakdown.tfidf_similarity_score,
+                "skill_match": score_breakdown.skill_match_score,
+                "experience_signal": score_breakdown.experience_score,
+                "section_completeness": score_breakdown.section_completeness_score,
+            },
+            "matched_skills": score_breakdown.matched_skills,
+            "missing_skills": score_breakdown.missing_skills,
+            "resume_sections_found": score_breakdown.resume_sections_found,
+            "explanation": response.text,
+            "resume_text": resume_text,
+        }
+ 
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Analysis failed: {str(e)}")
+
