@@ -3,11 +3,6 @@ import { useState, useRef, useEffect } from "react";
 const API = "https://careerpilot-api-v1i2.onrender.com";
 
 // ── helpers ──────────────────────────────────────────────────────────────────
-function extractScore(text) {
-  const m = text?.match(/Score:\s*(\d+)/);
-  return m ? parseInt(m[1], 10) : null;
-}
-
 function saveHistory(entry) {
   const prev = JSON.parse(localStorage.getItem("cp_history") || "[]");
   prev.unshift({ ...entry, id: Date.now(), date: new Date().toLocaleDateString() });
@@ -54,6 +49,21 @@ function ScoreRing({ score }) {
   );
 }
 
+function MiniBar({ label, value }) {
+  const color = value >= 75 ? "#22c55e" : value >= 50 ? "#f59e0b" : "#ef4444";
+  return (
+    <div style={{ flex: 1, minWidth: 120 }}>
+      <div style={{ display: "flex", justifyContent: "space-between", marginBottom: 4 }}>
+        <span style={{ fontSize: 11, color: "#6b7280", fontWeight: 500 }}>{label}</span>
+        <span style={{ fontSize: 11, color, fontWeight: 700, fontFamily: "DM Mono, monospace" }}>{Math.round(value)}</span>
+      </div>
+      <div style={{ height: 6, background: "#1f2230", borderRadius: 100, overflow: "hidden" }}>
+        <div style={{ height: "100%", width: `${Math.min(value, 100)}%`, background: color, borderRadius: 100, transition: "width 0.8s ease" }} />
+      </div>
+    </div>
+  );
+}
+
 function Tag({ children, color = "#6366f1" }) {
   return (
     <span style={{
@@ -75,8 +85,8 @@ function CopyBtn({ text }) {
   );
 }
 
-// ── result renderer ───────────────────────────────────────────────────────────
-function ResultRenderer({ text }) {
+// ── explanation renderer (Gemini's natural-language text, no score parsing needed) ──
+function ExplanationRenderer({ text }) {
   if (!text) return null;
   const sections = [];
   let current = null;
@@ -93,44 +103,26 @@ function ResultRenderer({ text }) {
 
   return (
     <div style={{ display: "flex", flexDirection: "column", gap: 20 }}>
-      {sections.map((s, i) => {
-        const isKeywords = s.heading.toLowerCase().includes("keyword");
-        const keywords = isKeywords
-          ? s.lines.join(" ").split(",").map(k => k.trim()).filter(Boolean)
-          : [];
-
-        return (
-          <div key={i}>
-            <div style={{ fontSize: 11, fontWeight: 600, color: "#6366f1", letterSpacing: "0.1em", textTransform: "uppercase", marginBottom: 8, paddingBottom: 6, borderBottom: "1px solid #1f2230" }}>
-              {s.heading}
-            </div>
-            {isKeywords ? (
-              <div>{keywords.map((k, j) => <Tag key={j}>{k}</Tag>)}</div>
-            ) : (
-              <div style={{ display: "flex", flexDirection: "column", gap: 4 }}>
-                {s.lines.map((line, j) => {
-                  const clean = line.replace(/\*\*/g, "").trim();
-                  if (!clean) return null;
-                  if (clean.startsWith("- ")) {
-                    const txt = clean.slice(2);
-                    const isGood = s.heading.toLowerCase().includes("match");
-                    const isBad = s.heading.toLowerCase().includes("missing");
-                    const dot = isGood ? "✅" : isBad ? "❌" : "•";
-                    return <div key={j} style={{ display: "flex", gap: 8, fontSize: 14, color: "#d1d5db", lineHeight: 1.6 }}><span>{dot}</span><span>{txt}</span></div>;
-                  }
-                  if (/^\d+\. /.test(clean)) {
-                    return <div key={j} style={{ fontSize: 14, color: "#d1d5db", lineHeight: 1.6 }}>{clean}</div>;
-                  }
-                  if (clean.startsWith("Score:")) {
-                    return null; // rendered via ScoreRing
-                  }
-                  return <p key={j} style={{ fontSize: 14, color: "#9ca3af", lineHeight: 1.7, margin: 0 }}>{clean}</p>;
-                })}
-              </div>
-            )}
+      {sections.map((s, i) => (
+        <div key={i}>
+          <div style={{ fontSize: 11, fontWeight: 600, color: "#6366f1", letterSpacing: "0.1em", textTransform: "uppercase", marginBottom: 8, paddingBottom: 6, borderBottom: "1px solid #1f2230" }}>
+            {s.heading}
           </div>
-        );
-      })}
+          <div style={{ display: "flex", flexDirection: "column", gap: 4 }}>
+            {s.lines.map((line, j) => {
+              const clean = line.replace(/\*\*/g, "").trim();
+              if (!clean) return null;
+              if (clean.startsWith("- ")) {
+                return <div key={j} style={{ display: "flex", gap: 8, fontSize: 14, color: "#d1d5db", lineHeight: 1.6 }}><span>•</span><span>{clean.slice(2)}</span></div>;
+              }
+              if (/^\d+\. /.test(clean)) {
+                return <div key={j} style={{ fontSize: 14, color: "#d1d5db", lineHeight: 1.6 }}>{clean}</div>;
+              }
+              return <p key={j} style={{ fontSize: 14, color: "#9ca3af", lineHeight: 1.7, margin: 0 }}>{clean}</p>;
+            })}
+          </div>
+        </div>
+      ))}
     </div>
   );
 }
@@ -160,10 +152,14 @@ export default function App() {
   const [dragOver, setDragOver] = useState(false);
   const fileInputRef = useRef(null);
 
-  // analysis state
-  const [result, setResult] = useState("");
+  // analysis state — now driven by /upload-resume-v2's custom scoring response
+  const [explanation, setExplanation] = useState("");
   const [resumeText, setResumeText] = useState("");
   const [score, setScore] = useState(null);
+  const [breakdown, setBreakdown] = useState(null);       // { tfidf_similarity, skill_match, experience_signal, section_completeness }
+  const [matchedSkills, setMatchedSkills] = useState([]);
+  const [missingSkills, setMissingSkills] = useState([]);
+  const [sectionsFound, setSectionsFound] = useState([]);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
 
@@ -190,27 +186,41 @@ export default function App() {
     else setError("Please upload a PDF file.");
   };
 
-  // ── analyze ──
+  // ── analyze — now calls the custom-scoring endpoint ──
   const analyze = async () => {
     if (!file) return setError("Please upload a resume PDF.");
     if (!job.trim()) return setError("Please paste a job description.");
-    setError(""); setResult(""); setCoverLetter(""); setScore(null);
+    setError(""); setExplanation(""); setCoverLetter(""); setScore(null); setBreakdown(null);
+    setMatchedSkills([]); setMissingSkills([]); setSectionsFound([]);
     setLoading(true);
     try {
       const fd = new FormData();
       fd.append("resume", file);
       fd.append("job", job);
-      const res = await fetch(`${API}/upload-resume`, { method: "POST", body: fd });
+      const res = await fetch(`${API}/upload-resume-v2`, { method: "POST", body: fd });
       const data = await res.json();
-      if (!res.ok || data.error) return setError(data.error || "Analysis failed.");
-      setResult(data.result);
+      if (!res.ok || data.error) return setError(data.error || data.detail || "Analysis failed.");
+
+      setExplanation(data.explanation);
       setResumeText(data.resume_text || "");
-      const s = extractScore(data.result);
-      setScore(s);
-      const entry = { score: s, job: job.slice(0, 60), result: data.result, resume_text: data.resume_text };
+      setScore(data.score);
+      setBreakdown(data.score_breakdown || null);
+      setMatchedSkills(data.matched_skills || []);
+      setMissingSkills(data.missing_skills || []);
+      setSectionsFound(data.resume_sections_found || []);
+
+      const entry = {
+        score: data.score,
+        job: job.slice(0, 60),
+        explanation: data.explanation,
+        resume_text: data.resume_text,
+        breakdown: data.score_breakdown,
+        matched_skills: data.matched_skills,
+        missing_skills: data.missing_skills,
+      };
       saveHistory(entry);
       setHistory(getHistory());
-    } catch { setError("Cannot connect to server. Is Flask running?"); }
+    } catch { setError("Cannot connect to server. Is the backend running?"); }
     finally { setLoading(false); }
   };
 
@@ -225,7 +235,7 @@ export default function App() {
         body: JSON.stringify({ resume_text: resumeText, job }),
       });
       const data = await res.json();
-      if (!res.ok || data.error) return setClError(data.error || "Failed.");
+      if (!res.ok || data.error) return setClError(data.error || data.detail || "Failed.");
       setCoverLetter(data.cover_letter);
     } catch { setClError("Cannot connect to server."); }
     finally { setClLoading(false); }
@@ -242,7 +252,7 @@ export default function App() {
         body: JSON.stringify({ resume_text: editorText, job }),
       });
       const data = await res.json();
-      if (!res.ok || data.error) return setRwError(data.error || "Failed.");
+      if (!res.ok || data.error) return setRwError(data.error || data.detail || "Failed.");
       setEditorText(data.rewritten);
     } catch { setRwError("Cannot connect to server."); }
     finally { setRewriting(false); }
@@ -255,7 +265,7 @@ export default function App() {
       const res = await fetch(`${API}/export-pdf`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ analysis: result, cover_letter: coverLetter, score }),
+        body: JSON.stringify({ analysis: explanation, cover_letter: coverLetter, score }),
       });
       if (!res.ok) return alert("Export failed.");
       const blob = await res.blob();
@@ -267,7 +277,7 @@ export default function App() {
     finally { setExporting(false); }
   };
 
-  const hasResult = !!result;
+  const hasResult = !!explanation;
 
   // ── styles ──
   const S = {
@@ -307,7 +317,7 @@ export default function App() {
         {/* ── header ── */}
         <div style={{ textAlign: "center", marginBottom: 44 }}>
           <div style={{ display: "inline-flex", alignItems: "center", gap: 8, background: "rgba(99,102,241,0.15)", border: "1px solid rgba(99,102,241,0.3)", borderRadius: 100, padding: "6px 16px", fontSize: 11, fontWeight: 500, color: "#a5b4fc", letterSpacing: "0.1em", textTransform: "uppercase", marginBottom: 18 }}>
-            ✦ AI-Powered
+            ✦ Custom NLP Scoring + AI Explanations
           </div>
           <h1 style={{ fontSize: "clamp(32px,5vw,52px)", fontWeight: 600, letterSpacing: "-1.5px", color: "#f0f2ff", lineHeight: 1.1, marginBottom: 10 }}>
             Career<span style={{ background: "linear-gradient(135deg,#818cf8,#c084fc)", WebkitBackgroundClip: "text", WebkitTextFillColor: "transparent" }}>Pilot</span>
@@ -360,19 +370,63 @@ export default function App() {
 
             {/* result */}
             {hasResult && (
-              <div className="fade-in" style={{ marginTop: 24, ...S.card }}>
-                <div style={{ display: "flex", alignItems: "center", gap: 12, marginBottom: 20, paddingBottom: 16, borderBottom: "1px solid #1f2230" }}>
-                  <span style={{ fontSize: 14, fontWeight: 500, color: "#9ca3af", flex: 1 }}>📊 Analysis Complete</span>
-                  {score !== null && <ScoreRing score={score} />}
-                  <div style={{ display: "flex", gap: 8, marginLeft: "auto" }}>
-                    <CopyBtn text={result} />
-                    <button onClick={exportPDF} disabled={exporting} style={S.btn(exporting, "ghost")}>
-                      {exporting ? <Spinner size={14} /> : "⬇ Export PDF"}
-                    </button>
+              <div className="fade-in" style={{ marginTop: 24, display: "flex", flexDirection: "column", gap: 16 }}>
+
+                {/* score + breakdown card */}
+                <div style={S.card}>
+                  <div style={{ display: "flex", alignItems: "center", gap: 20, flexWrap: "wrap" }}>
+                    {score !== null && <ScoreRing score={score} />}
+                    <div style={{ flex: 1, minWidth: 220, display: "flex", flexDirection: "column", gap: 12 }}>
+                      <div style={S.sectionHead}>Score Breakdown (Custom Algorithm)</div>
+                      {breakdown && (
+                        <div style={{ display: "flex", flexWrap: "wrap", gap: 16 }}>
+                          <MiniBar label="Text Similarity (TF-IDF)" value={breakdown.tfidf_similarity} />
+                          <MiniBar label="Skill Match" value={breakdown.skill_match} />
+                          <MiniBar label="Experience Signal" value={breakdown.experience_signal} />
+                          <MiniBar label="Section Completeness" value={breakdown.section_completeness} />
+                        </div>
+                      )}
+                    </div>
                   </div>
+
+                  {(matchedSkills.length > 0 || missingSkills.length > 0) && (
+                    <div style={{ marginTop: 20, paddingTop: 16, borderTop: "1px solid #1f2230", display: "flex", flexDirection: "column", gap: 12 }}>
+                      {matchedSkills.length > 0 && (
+                        <div>
+                          <div style={{ fontSize: 11, color: "#22c55e", fontWeight: 600, marginBottom: 6, textTransform: "uppercase", letterSpacing: "0.06em" }}>✅ Matched Skills</div>
+                          <div>{matchedSkills.map((s, i) => <Tag key={i} color="#22c55e">{s}</Tag>)}</div>
+                        </div>
+                      )}
+                      {missingSkills.length > 0 && (
+                        <div>
+                          <div style={{ fontSize: 11, color: "#ef4444", fontWeight: 600, marginBottom: 6, textTransform: "uppercase", letterSpacing: "0.06em" }}>❌ Missing Skills</div>
+                          <div>{missingSkills.map((s, i) => <Tag key={i} color="#ef4444">{s}</Tag>)}</div>
+                        </div>
+                      )}
+                      {sectionsFound.length > 0 && (
+                        <div>
+                          <div style={{ fontSize: 11, color: "#6366f1", fontWeight: 600, marginBottom: 6, textTransform: "uppercase", letterSpacing: "0.06em" }}>📋 Resume Sections Detected</div>
+                          <div>{sectionsFound.map((s, i) => <Tag key={i}>{s}</Tag>)}</div>
+                        </div>
+                      )}
+                    </div>
+                  )}
                 </div>
-                <div style={{ maxHeight: 520, overflowY: "auto", paddingRight: 4 }}>
-                  <ResultRenderer text={result} />
+
+                {/* explanation card */}
+                <div style={S.card}>
+                  <div style={{ display: "flex", alignItems: "center", gap: 12, marginBottom: 20, paddingBottom: 16, borderBottom: "1px solid #1f2230" }}>
+                    <span style={{ fontSize: 14, fontWeight: 500, color: "#9ca3af", flex: 1 }}>🧠 AI Explanation & Suggestions</span>
+                    <div style={{ display: "flex", gap: 8 }}>
+                      <CopyBtn text={explanation} />
+                      <button onClick={exportPDF} disabled={exporting} style={S.btn(exporting, "ghost")}>
+                        {exporting ? <Spinner size={14} /> : "⬇ Export PDF"}
+                      </button>
+                    </div>
+                  </div>
+                  <div style={{ maxHeight: 520, overflowY: "auto", paddingRight: 4 }}>
+                    <ExplanationRenderer text={explanation} />
+                  </div>
                 </div>
               </div>
             )}
@@ -469,9 +523,18 @@ export default function App() {
                     const color = (h.score || 0) >= 75 ? "#22c55e" : (h.score || 0) >= 50 ? "#f59e0b" : "#ef4444";
                     return (
                       <div key={h.id} style={{ ...S.card, display: "flex", alignItems: "center", gap: 16, cursor: "pointer" }}
-                        onClick={() => { setResult(h.result || ""); setResumeText(h.resume_text || ""); setScore(h.score); setJob(h.job || ""); setTab("analyze"); }}>
+                        onClick={() => {
+                          setExplanation(h.explanation || "");
+                          setResumeText(h.resume_text || "");
+                          setScore(h.score);
+                          setBreakdown(h.breakdown || null);
+                          setMatchedSkills(h.matched_skills || []);
+                          setMissingSkills(h.missing_skills || []);
+                          setJob(h.job || "");
+                          setTab("analyze");
+                        }}>
                         <div style={{ width: 48, height: 48, borderRadius: "50%", background: color + "22", border: `2px solid ${color}44`, display: "flex", alignItems: "center", justifyContent: "center", fontSize: 14, fontWeight: 700, color, flexShrink: 0 }}>
-                          {h.score || "?"}
+                          {h.score ?? "?"}
                         </div>
                         <div style={{ flex: 1, minWidth: 0 }}>
                           <div style={{ fontSize: 13, color: "#e2e4eb", fontWeight: 500, marginBottom: 2, overflow: "hidden", whiteSpace: "nowrap", textOverflow: "ellipsis" }}>{h.job || "No job title"}</div>
